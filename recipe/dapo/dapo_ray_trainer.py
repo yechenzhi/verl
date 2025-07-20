@@ -285,43 +285,43 @@ class RayDAPOTrainer(RayPPOTrainer):
                         batch = new_batch
                     else:  # NOTE: When prompts after filtering is less than train batch size,
                         # we skip to the next generation batch
-                        # max_len = self.config.data.max_response_length
+                        max_len = self.config.data.max_response_length
 
-                        # # 只有在设置了有效阈值时才执行过滤
-                        # if max_len > 0:
-                        #     # 假设长度可以通过 attention_mask 在维度1上的和来计算
-                        #     # 请确保 'attention_mask' 是您数据结构中正确的键名
-                        #     seq_lengths = new_batch.batch["attention_mask"].sum(dim=-1)
+                        # 只有在设置了有效阈值时才执行过滤
+                        if max_len > 0:
+                            # 假设长度可以通过 attention_mask 在维度1上的和来计算
+                            # 请确保 'attention_mask' 是您数据结构中正确的键名
+                            seq_lengths = new_batch.batch["attention_mask"].sum(dim=-1)
 
-                        #     # 找到长度在阈值内的样本的索引
-                        #     # 使用 PyTorch 的布尔索引，非常高效
-                        #     long_rollout_indices = (seq_lengths >= max_len).nonzero(as_tuple=True)[0]
+                            # 找到长度在阈值内的样本的索引
+                            # 使用 PyTorch 的布尔索引，非常高效
+                            long_rollout_indices = (seq_lengths >= max_len).nonzero(as_tuple=True)[0]
 
-                        #     # 如果过滤后批次为空，则直接跳过，进行下一轮生成
-                        #     if len(long_rollout_indices) > 0:
-                        #         print(f"Found {long_rollout_indices.numel()} 个overlong rollouts (length >= {max_len}). will save it.")
-                        #         saver.save_long_rollouts(new_batch, long_rollout_indices, self.global_steps)
+                            # 如果过滤后批次为空，则直接跳过，进行下一轮生成
+                            if len(long_rollout_indices) > 0:
+                                print(f"Found {long_rollout_indices.numel()} 个overlong rollouts (length >= {max_len}). will save it.")
+                                saver.save_long_rollouts(new_batch, long_rollout_indices, self.global_steps)
             
-                        #     if self.config.algorithm.filter_groups.filter_long_rollouts:
-                        #         print("filter overlong rollouts")
+                            if self.config.algorithm.filter_groups.filter_long_rollouts:
+                                print("filter overlong rollouts")
                                 
-                        #         # 找到长度在阈值内的样本的索引 (用于过滤)
-                        #         length_kept_indices = (seq_lengths < max_len).nonzero(as_tuple=True)[0]
+                                # 找到长度在阈值内的样本的索引 (用于过滤)
+                                length_kept_indices = (seq_lengths < max_len).nonzero(as_tuple=True)[0]
 
-                        #         # 如果过滤后批次为空，则直接跳过，进行下一轮生成
-                        #         if len(length_kept_indices) == 0:
-                        #             print(f"长度过滤 (阈值={max_len}) 后，当前批次所有样本均被移除。继续生成...")
-                        #             progress_bar.update(1)
-                        #             continue # 跳到下一个生成批次
+                                # 如果过滤后批次为空，则直接跳过，进行下一轮生成
+                                if len(length_kept_indices) == 0:
+                                    print(f"长度过滤 (阈值={max_len}) 后，当前批次所有样本均被移除。继续生成...")
+                                    progress_bar.update(1)
+                                    continue # 跳到下一个生成批次
 
-                        #         # 使用找到的索引来创建一个新的、更小的 new_batch
-                        #         print(f'通过长度过滤: {len(seq_lengths)} -> {len(length_kept_indices)} 个响应')
-                        #         new_batch = new_batch[length_kept_indices]
+                                # 使用找到的索引来创建一个新的、更小的 new_batch
+                                print(f'通过长度过滤: {len(seq_lengths)} -> {len(length_kept_indices)} 个响应')
+                                new_batch = new_batch[length_kept_indices]
                             
-                        #     else:
-                        #         # 如果开关关闭，则不执行任何过滤操作
-                        #         print("no filter overlong rollouts")
-                        #         # new_batch 保持不变，包含所有序列
+                            else:
+                                # 如果开关关闭，则不执行任何过滤操作
+                                print("no filter overlong rollouts")
+                                # new_batch 保持不变，包含所有序列
 
                         metric_name = self.config.algorithm.filter_groups.metric
                         if metric_name == "seq_final_reward":
@@ -383,35 +383,35 @@ class RayDAPOTrainer(RayPPOTrainer):
 
                     batch.batch["response_mask"] = compute_response_mask(batch)
         
-                    # rewards_tensor = batch.batch["token_level_rewards"]
-                    # response_mask = batch.batch["response_mask"]
+                    rewards_tensor = batch.batch["token_level_rewards"]
+                    response_mask = batch.batch["response_mask"]
 
-                    # # Metric 1: Negative response ratio
-                    # # Calculate per-sequence reward, considering only the response part
-                    # sequence_rewards = (rewards_tensor * response_mask).sum(dim=-1)
-                    # total_sequences = sequence_rewards.size(0)
-                    # negative_sequences_mask = sequence_rewards < 0
-                    # num_negative_sequences = negative_sequences_mask.sum().item()
-                    # if total_sequences > 0:
-                    #     negative_response_ratio = num_negative_sequences / total_sequences
-                    # else:
-                    #     negative_response_ratio = 0.0
+                    # Metric 1: Negative response ratio
+                    # Calculate per-sequence reward, considering only the response part
+                    sequence_rewards = (rewards_tensor * response_mask).sum(dim=-1)
+                    total_sequences = sequence_rewards.size(0)
+                    negative_sequences_mask = sequence_rewards < 0
+                    num_negative_sequences = negative_sequences_mask.sum().item()
+                    if total_sequences > 0:
+                        negative_response_ratio = num_negative_sequences / total_sequences
+                    else:
+                        negative_response_ratio = 0.0
                     
-                    # # Metric 2: Negative token ratio
-                    # # Calculate total tokens in response
-                    # total_response_tokens = response_mask.sum().item()
-                    # if total_response_tokens > 0:
-                    #     # Count negative reward tokens only within the response
-                    #     num_tokens_in_negative_sequences = response_mask[negative_sequences_mask].sum().item()
-                    #     negative_token_ratio = num_tokens_in_negative_sequences / total_response_tokens
-                    # else:
-                    #     negative_token_ratio = 0.0
+                    # Metric 2: Negative token ratio
+                    # Calculate total tokens in response
+                    total_response_tokens = response_mask.sum().item()
+                    if total_response_tokens > 0:
+                        # Count negative reward tokens only within the response
+                        num_tokens_in_negative_sequences = response_mask[negative_sequences_mask].sum().item()
+                        negative_token_ratio = num_tokens_in_negative_sequences / total_response_tokens
+                    else:
+                        negative_token_ratio = 0.0
 
-                    # reward_stats_metrics = {
-                    #     "actor/negative_response_ratio": negative_response_ratio,
-                    #     "actor/negative_token_ratio": negative_token_ratio,
-                    # }
-                    # metrics.update(reward_stats_metrics)
+                    reward_stats_metrics = {
+                        "actor/negative_response_ratio": negative_response_ratio,
+                        "actor/negative_token_ratio": negative_token_ratio,
+                    }
+                    metrics.update(reward_stats_metrics)
 
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
