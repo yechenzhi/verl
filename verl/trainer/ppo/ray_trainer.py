@@ -669,7 +669,6 @@ class RayPPOTrainer:
         sample_outputs = []
         sample_scores = []
         sample_turns = []
-
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
 
@@ -785,7 +784,7 @@ class RayPPOTrainer:
                 for metric_name, metric_val in metric2val.items():
                     if (
                         (var_name == core_var)
-                        and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])
+                        and any(metric_name.startswith(pfx) for pfx in ["mean", "pass", "maj", "best"])
                         and (f"@{n_max}" in metric_name)
                     ):
                         metric_sec = "val-core"

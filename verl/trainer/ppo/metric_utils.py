@@ -334,7 +334,6 @@ def calc_maj_val(data: list[dict[str, Any]], vote_key: str, val_key: str) -> flo
 
     return maj_val
 
-
 def process_validation_metrics(
     data_sources: list[str], sample_inputs: list[str], infos_dict: dict[str, list[Any]], seed: int = 42
 ) -> dict[str, dict[str, dict[str, float]]]:
@@ -365,6 +364,7 @@ def process_validation_metrics(
         Where metric_name includes:
         - "mean@N": Mean value across N samples
         - "std@N": Standard deviation across N samples
+        - "pass@N": Pass rate where at least one success counts as a pass for N samples
         - "best@N/mean": Mean of the best values in bootstrap samples of size N
         - "best@N/std": Standard deviation of the best values in bootstrap samples
         - "worst@N/mean": Mean of the worst values in bootstrap samples
@@ -375,7 +375,7 @@ def process_validation_metrics(
     Example:
         >>> data_sources = ["source1", "source1", "source2"]
         >>> sample_inputs = ["prompt1", "prompt1", "prompt2"]
-        >>> infos_dict = {"score": [0.8, 0.9, 0.7], "pred": ["A", "A", "B"]}
+        >>> infos_dict = {"score": [0.8, 0.9, 0.7], "pred": ["A", "A", "B"], "is_correct": [0, 1, 0]}
         >>> result = process_validation_metrics(data_sources, sample_inputs, infos_dict)
         >>> # result will contain statistics for each data source and variable
     """
@@ -399,6 +399,12 @@ def process_validation_metrics(
                 n_resps = len(var_vals)
                 metric[f"mean@{n_resps}"] = np.mean(var_vals)
 
+                # MODIFICATION START: 添加 pass@n 指标的计算
+                # pass@n 指标仅对二进制（0或1）数据有意义
+                
+                metric[f"pass@{n_resps}"] = 1.0 if any(v > 0 for v in var_vals) else 0.0
+                
+
                 if n_resps > 1:
                     metric[f"std@{n_resps}"] = np.std(var_vals)
 
@@ -410,11 +416,27 @@ def process_validation_metrics(
                     ns.append(n_resps)
 
                     for n in ns:
+                        # 计算 best@n 和 worst@n
                         [(bon_mean, bon_std), (won_mean, won_std)] = bootstrap_metric(
                             data=var_vals, subset_size=n, reduce_fns=[np.max, np.min], seed=seed
                         )
                         metric[f"best@{n}/mean"], metric[f"best@{n}/std"] = bon_mean, bon_std
                         metric[f"worst@{n}/mean"], metric[f"worst@{n}/std"] = won_mean, won_std
+                        
+                        # MODIFICATION START: 在自举循环中添加 pass@n 的计算
+                        
+                        # 定义用于计算 pass@n 的函数：样本中只要有1，就返回1.0
+                        pass_at_n_reduce_fn = lambda sample: 1.0 if any(s > 0 for s in sample) else 0.0
+                        [(pass_n_mean, pass_n_std)] = bootstrap_metric(
+                            data=var_vals,
+                            subset_size=n,
+                            reduce_fns=[pass_at_n_reduce_fn],
+                            seed=seed,
+                        )
+                        metric[f"pass@{n}/mean"], metric[f"pass@{n}/std"] = pass_n_mean, pass_n_std
+                        # MODIFICATION END
+
+                        # 计算 maj@n
                         if var2vals.get("pred", None) is not None:
                             vote_data = [{"val": val, "pred": pred} for val, pred in zip(var_vals, var2vals["pred"])]
                             [(maj_n_mean, maj_n_std)] = bootstrap_metric(

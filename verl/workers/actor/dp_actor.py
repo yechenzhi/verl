@@ -492,9 +492,22 @@ class DataParallelPPOActor(BasePPOActor):
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
 
                     if self.config.policy_loss.loss_mode == "vanilla":
-                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
+                        # pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, pg_clipfrac_left, pg_clipfrac_right, pg_clipfrac_left_mean, pg_clipfrac_right_mean, avg_max_prob_left_clipped, avg_max_prob_right_clipped  = compute_policy_loss(
+                        #     old_log_prob=old_log_prob,
+                        #     log_prob=log_prob,
+                        #     entropy=entropy,
+                        #     advantages=advantages,
+                        #     response_mask=response_mask,
+                        #     cliprange=clip_ratio,
+                        #     cliprange_low=clip_ratio_low,
+                        #     cliprange_high=clip_ratio_high,
+                        #     clip_ratio_c=clip_ratio_c,
+                        #     loss_agg_mode=loss_agg_mode,
+                        # )
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower  = compute_policy_loss(
                             old_log_prob=old_log_prob,
                             log_prob=log_prob,
+                            # entropy=entropy,
                             advantages=advantages,
                             response_mask=response_mask,
                             cliprange=clip_ratio,
@@ -541,7 +554,13 @@ class DataParallelPPOActor(BasePPOActor):
                             "actor/pg_loss": pg_loss.detach().item(),
                             "actor/pg_clipfrac": pg_clipfrac.detach().item(),
                             "actor/ppo_kl": ppo_kl.detach().item(),
-                            "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+                            "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item()
+                            # "actor/pg_clipfrac_left": pg_clipfrac_left.detach().item(),
+                            # "actor/pg_clipfrac_right": pg_clipfrac_right.detach().item(),
+                            # "actor/pg_clipfrac_left_mean": pg_clipfrac_left_mean.detach().item(),
+                            # "actor/pg_clipfrac_right_mean": pg_clipfrac_right_mean.detach().item(),
+                            # "actor/avg_max_prob_left_clipped": avg_max_prob_left_clipped.detach().item(),
+                            # "actor/avg_max_prob_right_clipped": avg_max_prob_right_clipped.detach().item()
                         }
                     )
                     append_to_dict(metrics, micro_batch_metrics)

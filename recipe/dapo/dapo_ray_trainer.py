@@ -42,6 +42,89 @@ from verl.trainer.ppo.ray_trainer import (
 )
 from verl.utils.debug import marked_timer
 
+import threading
+import json
+import torch
+import numpy as np
+import uuid
+from collections import defaultdict
+
+class AsyncRolloutSaver:
+    """
+    一个异步将超长 rollout 保存到文件的类。
+    它使用一个单独的线程来执行文件I/O，以避免阻塞主训练循环。
+    数据被保存为 JSON Lines (.jsonl) 格式。
+    """
+    def __init__(self, filepath: str):
+        """
+        初始化 Saver。
+        :param filepath: 保存数据的文件路径。
+        """
+        self.filepath = filepath
+        self._lock = threading.Lock()
+        print(f"异步 Rollout Saver 已初始化，将保存超长序列到: {self.filepath}")
+
+    def _prepare_data_for_serialization(self, batch_data, indices, step: int):
+        """
+        从 DataProto 批次中提取指定索引的数据，并准备成可序列化的格式。
+        """
+        data_to_save = []
+        
+        # 从 non_tensor_batch 中获取 uids (如果存在)
+        uids = batch_data.non_tensor_batch.get("uid", [None] * len(batch_data))
+        
+        for idx in indices:
+            # 将张量转换为列表以便JSON序列化
+            # 您可以根据需要保存更多或更少的信息
+            rollout_info = {
+                "step": step,
+                "uid": uids[idx],
+                "input_ids": batch_data.batch["input_ids"][idx].tolist(),
+                "attention_mask": batch_data.batch["attention_mask"][idx].tolist(),
+                "sequence_length": int(batch_data.batch["attention_mask"][idx].sum())
+            }
+            
+            # 如果有其他想保存的张量或非张量数据，也可以在这里添加
+            # 例如: token_level_rewards
+            if "token_level_rewards" in batch_data.batch:
+                rollout_info["token_level_rewards"] = batch_data.batch["token_level_rewards"][idx].tolist()
+
+            data_to_save.append(rollout_info)
+            
+        return data_to_save
+
+    def _save_worker(self, data_list: list):
+        """
+        在单独的线程中运行的工作函数，负责将数据写入文件。
+        """
+        try:
+            with self._lock: # 确保线程安全
+                with open(self.filepath, 'a', encoding='utf-8') as f:
+                    for item in data_list:
+                        f.write(json.dumps(item) + '\n')
+        except IOError as e:
+            print(f"Error: [AsyncRolloutSaver] 写入文件失败: {e}")
+        except Exception as e:
+            print(f"Error: [AsyncRolloutSaver] 发生未知错误: {e}")
+
+    def save_long_rollouts(self, batch_data, long_rollout_indices, step: int):
+        """
+        公共接口，用于异步保存过长的 rollouts。
+        :param batch_data: 包含所有 rollouts 的 DataProto 对象。
+        :param long_rollout_indices: 过长 rollouts 在批次中的索引列表。
+        :param step: 当前的训练步骤。
+        """
+        if not long_rollout_indices.numel(): # 如果没有需要保存的数据
+            return
+
+        # 准备数据
+        data_to_save = self._prepare_data_for_serialization(batch_data, long_rollout_indices.tolist(), step)
+        
+        # 创建并启动一个守护线程来执行写入操作
+        # 守护线程会在主程序退出时自动结束
+        thread = threading.Thread(target=self._save_worker, args=(data_to_save,))
+        thread.daemon = True
+        thread.start()
 
 class RayDAPOTrainer(RayPPOTrainer):
     """
@@ -71,6 +154,12 @@ class RayDAPOTrainer(RayPPOTrainer):
         # load checkpoint before doing anything
         self._load_checkpoint()
 
+        if self.config.algorithm.get("enable_model_merging", False):
+            print("Initializing model merging baseline (post-checkpoint-load)...")
+            self.actor_rollout_wg.initialize_merging_baseline()
+            print("Model merging baseline initialized.")
+
+
         # perform validation before training
         # currently, we only support validation using the reward_function.
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
@@ -92,6 +181,8 @@ class RayDAPOTrainer(RayPPOTrainer):
         batch = None
         num_prompt_in_batch = 0
         num_gen_batches = 0
+        saver = AsyncRolloutSaver(filepath="/root/highspeedstorage/h800/data/long-rollouts/long_rollouts.jsonl")
+
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 do_profile = self.global_steps in (self.config.trainer.profile_steps or [])
@@ -189,11 +280,49 @@ class RayDAPOTrainer(RayPPOTrainer):
                             )  # TODO: This will be cleared if we use multiple genenration batches
                         else:
                             new_batch.batch["token_level_rewards"] = new_batch.batch["token_level_scores"]
-
+    
                     if not self.config.algorithm.filter_groups.enable:
                         batch = new_batch
                     else:  # NOTE: When prompts after filtering is less than train batch size,
                         # we skip to the next generation batch
+                        # max_len = self.config.data.max_response_length
+
+                        # # 只有在设置了有效阈值时才执行过滤
+                        # if max_len > 0:
+                        #     # 假设长度可以通过 attention_mask 在维度1上的和来计算
+                        #     # 请确保 'attention_mask' 是您数据结构中正确的键名
+                        #     seq_lengths = new_batch.batch["attention_mask"].sum(dim=-1)
+
+                        #     # 找到长度在阈值内的样本的索引
+                        #     # 使用 PyTorch 的布尔索引，非常高效
+                        #     long_rollout_indices = (seq_lengths >= max_len).nonzero(as_tuple=True)[0]
+
+                        #     # 如果过滤后批次为空，则直接跳过，进行下一轮生成
+                        #     if len(long_rollout_indices) > 0:
+                        #         print(f"Found {long_rollout_indices.numel()} 个overlong rollouts (length >= {max_len}). will save it.")
+                        #         saver.save_long_rollouts(new_batch, long_rollout_indices, self.global_steps)
+            
+                        #     if self.config.algorithm.filter_groups.filter_long_rollouts:
+                        #         print("filter overlong rollouts")
+                                
+                        #         # 找到长度在阈值内的样本的索引 (用于过滤)
+                        #         length_kept_indices = (seq_lengths < max_len).nonzero(as_tuple=True)[0]
+
+                        #         # 如果过滤后批次为空，则直接跳过，进行下一轮生成
+                        #         if len(length_kept_indices) == 0:
+                        #             print(f"长度过滤 (阈值={max_len}) 后，当前批次所有样本均被移除。继续生成...")
+                        #             progress_bar.update(1)
+                        #             continue # 跳到下一个生成批次
+
+                        #         # 使用找到的索引来创建一个新的、更小的 new_batch
+                        #         print(f'通过长度过滤: {len(seq_lengths)} -> {len(length_kept_indices)} 个响应')
+                        #         new_batch = new_batch[length_kept_indices]
+                            
+                        #     else:
+                        #         # 如果开关关闭，则不执行任何过滤操作
+                        #         print("no filter overlong rollouts")
+                        #         # new_batch 保持不变，包含所有序列
+
                         metric_name = self.config.algorithm.filter_groups.metric
                         if metric_name == "seq_final_reward":
                             # Turn to numpy for easier filtering
@@ -253,6 +382,36 @@ class RayDAPOTrainer(RayPPOTrainer):
                     # === Updating ===
 
                     batch.batch["response_mask"] = compute_response_mask(batch)
+        
+                    # rewards_tensor = batch.batch["token_level_rewards"]
+                    # response_mask = batch.batch["response_mask"]
+
+                    # # Metric 1: Negative response ratio
+                    # # Calculate per-sequence reward, considering only the response part
+                    # sequence_rewards = (rewards_tensor * response_mask).sum(dim=-1)
+                    # total_sequences = sequence_rewards.size(0)
+                    # negative_sequences_mask = sequence_rewards < 0
+                    # num_negative_sequences = negative_sequences_mask.sum().item()
+                    # if total_sequences > 0:
+                    #     negative_response_ratio = num_negative_sequences / total_sequences
+                    # else:
+                    #     negative_response_ratio = 0.0
+                    
+                    # # Metric 2: Negative token ratio
+                    # # Calculate total tokens in response
+                    # total_response_tokens = response_mask.sum().item()
+                    # if total_response_tokens > 0:
+                    #     # Count negative reward tokens only within the response
+                    #     num_tokens_in_negative_sequences = response_mask[negative_sequences_mask].sum().item()
+                    #     negative_token_ratio = num_tokens_in_negative_sequences / total_response_tokens
+                    # else:
+                    #     negative_token_ratio = 0.0
+
+                    # reward_stats_metrics = {
+                    #     "actor/negative_response_ratio": negative_response_ratio,
+                    #     "actor/negative_token_ratio": negative_token_ratio,
+                    # }
+                    # metrics.update(reward_stats_metrics)
 
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
@@ -315,6 +474,11 @@ class RayDAPOTrainer(RayPPOTrainer):
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+                    
+                    if self.config.algorithm.get("enable_model_merging", False):
+                        with marked_timer("model_merging", timing_raw, "purple"):
+                            alpha = self.config.algorithm.get("model_merging_alpha", 0.0)
+                            self.actor_rollout_wg.model_merging(alpha)
 
                     # validate
                     if (

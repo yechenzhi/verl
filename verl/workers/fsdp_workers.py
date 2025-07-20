@@ -33,6 +33,7 @@ from safetensors.torch import save_file
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
+from verl.utils.logger import log_with_rank
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.models.transformers.monkey_patch import apply_monkey_patch
@@ -57,6 +58,7 @@ from verl.utils.fsdp_utils import (
     CPUOffloadPolicy,
     MixedPrecisionPolicy,
     apply_fsdp2,
+    get_fsdp_full_state_dict,
     fsdp2_load_full_state_dict,
     fsdp_version,
     get_fsdp_wrap_policy,
@@ -834,8 +836,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
-        from verl.utils.logger import log_with_rank
-
         # only support save and load ckpt for actor
         assert self._is_actor
 
@@ -900,6 +900,99 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(self.actor_optimizer)
+    
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def initialize_merging_baseline(self):
+        """
+        Captures the initial state of the model before training starts.
+        This state will be used as the baseline for the first model merge.
+        """
+        if not self._is_actor:
+            return
+
+        log_with_rank("Initializing model merging baseline...", rank=dist.get_rank(), logger=logger, log_only_rank_0=True)
+        
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        
+        # Use the provided helper function to get the full state dict on CPU at rank 0
+        initial_state_dict = get_fsdp_full_state_dict(
+            self.actor_module_fsdp, offload_to_cpu=True, rank0_only=True
+        )
+            
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+
+        if dist.get_rank() == 0:
+            for key, params in initial_state_dict.items():
+                initial_state_dict[key] = params.cpu()
+            self.previous_model_state_dict_cpu = initial_state_dict
+            log_with_rank(f"Baseline for merging initialized with {len(initial_state_dict)} tensors.", rank=0, logger=logger)
+        
+        dist.barrier()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def model_merging(self, alpha: float):
+        """
+        Performs model merging with the model state from the previous step.
+        This version uses a robust, custom loading function tailored for FSDP v2.
+        """
+        if not self._is_actor:
+            return
+
+        log_with_rank("Starting model merging process (using custom FSDP v2 loader)...", rank=dist.get_rank(), logger=logger, log_only_rank_0=True)
+
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        # 1. Get the full state_dict on the CPU of rank 0. (No change here)
+        current_state_dict = get_fsdp_full_state_dict(
+            self.actor_module_fsdp, offload_to_cpu=True, rank0_only=True
+        )
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+
+        state_to_load = None
+        # 2. On rank 0, perform the merge logic. (No change here)
+        if dist.get_rank() == 0:
+            assert self.previous_model_state_dict_cpu is not None, \
+                "Merging baseline was not initialized. Call `initialize_merging_baseline` before training."
+
+            log_with_rank(f"Performing model merge with alpha={alpha}", rank=0, logger=logger)
+            merged_state_dict = {}
+            for key, current_param in current_state_dict.items():
+                if key in self.previous_model_state_dict_cpu:
+                    prev_param = self.previous_model_state_dict_cpu[key].to(current_param.device, non_blocking=True)
+                    merged_state_dict[key] = alpha * current_param + (1.0 - alpha) * prev_param.to(current_param.dtype)
+                else:
+                    log_with_rank(f"Warning: Key '{key}' not found in previous model state. Using current parameter.", rank=0, logger=logger)
+                    merged_state_dict[key] = current_param
+            state_to_load = merged_state_dict
+
+            for key, params in current_state_dict.items():
+                self.previous_model_state_dict_cpu[key] = params.cpu()
+        
+        dist.barrier()
+
+        # 4. Load the new state_dict into the model using the provided robust function.
+        # This replaces the previous, simpler `set_model_state_dict` call.
+        log_with_rank("Loading merged state_dict into FSDP model...", rank=dist.get_rank(), logger=logger, log_only_rank_0=True)
+        
+        # The `state_to_load` dictionary only exists on rank 0.
+        # The custom function correctly handles broadcasting it to all ranks, synchronizing buffers,
+        # and respecting the CPU offload configuration.
+        fsdp2_load_full_state_dict(
+            model=self.actor_module_fsdp,
+            full_state=state_to_load if dist.get_rank() == 0 else {},
+            device_mesh=self.device_mesh,
+            # Pass the boolean flag indicating if CPU offload is enabled for the actor model.
+            # The worker stores this state in `_is_offload_param`.
+            cpu_offload=self._is_offload_param
+        )
+        
+        dist.barrier()
+        log_with_rank("Model merging and loading complete.", rank=dist.get_rank(), logger=logger, log_only_rank_0=True)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def start_profile(self) -> None:

@@ -907,6 +907,8 @@ algorithm:
     # Power used for weight scaling in "pow" method
     weight_pow: 2.0
 
+  enable_model_merging: False
+  model_merging_alpha: 1.0
 # config for the trainer
 trainer:
 

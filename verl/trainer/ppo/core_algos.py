@@ -596,6 +596,158 @@ def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str
     return loss
 
 
+def compute_policy_loss2(
+    old_log_prob,
+    log_prob,
+    entropy,
+    advantages,
+    response_mask,
+    cliprange=None,
+    cliprange_low=None,
+    cliprange_high=None,
+    # --- 自适应 Clip 新增参数 ---
+    use_adaptive_clipping: bool = False,
+    adaptive_clip_min: float = 0.2,
+    adaptive_clip_max: float = 0.6,
+    vocab_size: int = 152064,
+    # --- 其他参数 ---
+    clip_ratio_c=3.0,
+    loss_agg_mode: str = "token-mean",
+):
+    """
+    Compute the clipped policy objective and related metrics for PPO.
+
+    Adapted from
+    https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py#L1122
+
+    Args:
+        old_log_prob (torch.Tensor):
+            Log-probabilities of actions under the old policy, shape (batch_size, response_length).
+        log_prob (torch.Tensor):
+            Log-probabilities of actions under the current policy, shape (batch_size, response_length).
+        advantages (torch.Tensor):
+            Advantage estimates for each action, shape (batch_size, response_length).
+        response_mask (torch.Tensor):
+            Mask indicating which tokens to include in the loss, shape (batch_size, response_length).
+        cliprange (float, optional):
+            Clipping parameter ε for standard PPO. See https://arxiv.org/abs/1707.06347.
+            Defaults to None (must be provided).
+        cliprange_low (float, optional):
+            Lower clip range for dual-clip PPO. Defaults to same as `cliprange`.
+        cliprange_high (float, optional):
+            Upper clip range for dual-clip PPO. Defaults to same as `cliprange`.
+        clip_ratio_c (float, optional):
+            Lower bound of the ratio for dual-clip PPO. See https://arxiv.org/pdf/1912.09729.
+            Defaults to 3.0.
+        loss_agg_mode (str, optional):
+            Aggregation mode for `agg_loss`. Defaults to "token-mean".
+    """
+    assert clip_ratio_c > 1.0, (
+        "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0,"
+        + f" but get the value: {clip_ratio_c}."
+    )
+    # =================================================================================
+    # START OF MODIFICATION: Adaptive Clipping Logic
+    # =================================================================================
+    if use_adaptive_clipping:
+        print("Using Adaptive Clipping.")
+        assert vocab_size is not None and vocab_size > 0, \
+            "vocab_size must be provided when use_adaptive_clipping is True."
+        
+        p_new = torch.exp(log_prob)
+        p_max = torch.exp(log_prob.max(-1, keepdim=True).values)
+        rel_p = (p_new / p_max).clamp(min=1e-8)
+
+        cliprange_high = cliprange_high * (1 + 0.6 * (1-rel_p) ** 2).detach()
+        cliprange_low = cliprange_low * (1 + 0.6 * (rel_p) ** 2).detach()
+        # cliprange_low = torch.full_like(cliprange_high, cliprange_low).detach()
+        
+        current_clip_low = cliprange_low
+        current_clip_high = cliprange_high
+    else:
+        print("Using Fixed Clipping.")
+        # 恢复原始逻辑：使用固定的 clip 值
+        current_clip_low = cliprange_low if cliprange_low is not None else cliprange
+        current_clip_high = cliprange_high if cliprange_high is not None else cliprange
+
+    # =================================================================================
+    # END OF MODIFICATION
+    # =================================================================================
+
+
+    negative_approx_kl = log_prob - old_log_prob
+    # Clamp negative_approx_kl for stability
+    negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
+    ratio = torch.exp(negative_approx_kl)
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+
+    prob = torch.exp(log_prob)
+
+    pg_losses1 = -advantages * ratio
+    pg_losses2 = -advantages * torch.clamp(
+        ratio, 1 - current_clip_low, 1 + current_clip_high
+    )  # - clip(ratio, 1-cliprange, 1+cliprange) * A
+    clip_pg_losses1 = torch.maximum(
+        pg_losses1, pg_losses2
+    )  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
+    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+    # --- Added monitoring metrics ---
+    # Condition for left clipping (ratio is too small)
+    # This happens when advantages are negative and the ratio is below the lower bound.
+    left_clip_condition = (advantages < 0) & (ratio < 1 - current_clip_low)
+    pg_clipfrac_left = verl_F.masked_mean(left_clip_condition.float(), response_mask)
+
+    # Condition for right clipping (ratio is too large)
+    # This happens when advantages are positive and the ratio is above the upper bound.
+    right_clip_condition = (advantages > 0) & (ratio > 1 + current_clip_high)
+    pg_clipfrac_right = verl_F.masked_mean(right_clip_condition.float(), response_mask)
+
+    # Masked mean of the probability ratio for the clipped tokens on the left.
+    masked_left_clip_condition = left_clip_condition.float() * response_mask
+    left_clipped_ratios_sum = (prob * masked_left_clip_condition).sum()
+    left_clipped_count = masked_left_clip_condition.sum()
+    pg_clipfrac_left_mean = left_clipped_ratios_sum / (left_clipped_count + 1e-8)
+
+    # Masked mean of the probability ratio for the clipped tokens on the right.
+    masked_right_clip_condition = right_clip_condition.float() * response_mask
+    right_clipped_ratios_sum = (prob * masked_right_clip_condition).sum()
+    right_clipped_count = masked_right_clip_condition.sum()
+    pg_clipfrac_right_mean = right_clipped_ratios_sum / (right_clipped_count + 1e-8)
+    # --- End of added metrics ---
+    left_clip_condition_masked = left_clip_condition & response_mask
+    right_clip_condition_masked = right_clip_condition & response_mask
+    probs_for_left_max = torch.where(left_clip_condition_masked.bool(), prob, 0.0)
+    # 沿序列长度维度求最小值，得到每条样本的最小概率
+    left_max_probs_per_sample = torch.max(probs_for_left_max, dim=1).values
+    
+    # 只对那些实际发生了 left clip 的样本求平均
+    samples_had_left_clip = torch.any(left_clip_condition_masked.bool(), dim=1)
+    sum_of_min_probs = (left_max_probs_per_sample * samples_had_left_clip.float()).sum()
+    num_samples_with_left_clip = samples_had_left_clip.sum()
+    # 计算最终指标：clip left 最小值的概率平均值
+    avg_max_prob_left_clipped = sum_of_min_probs / (num_samples_with_left_clip + 1e-8)
+    probs_for_right_max = torch.where(right_clip_condition_masked.bool(), prob, 0.0)
+    # 沿序列长度维度求最大值，得到每条样本的最大概率
+    max_probs_per_sample = torch.max(probs_for_right_max, dim=1).values
+
+    # 只对那些实际发生了 right clip 的样本求平均
+    samples_had_right_clip = torch.any(right_clip_condition_masked.bool(), dim=1)
+    sum_of_max_probs = (max_probs_per_sample * samples_had_right_clip.float()).sum()
+    num_samples_with_right_clip = samples_had_right_clip.sum()
+    # 计算最终指标：clip right 最大值的概率平均值
+    avg_max_prob_right_clipped = sum_of_max_probs / (num_samples_with_right_clip + 1e-8)
+
+    pg_losses3 = -advantages * clip_ratio_c
+    clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+    pg_clipfrac_lower = verl_F.masked_mean(
+        torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask
+    )
+
+    pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, pg_clipfrac_left, pg_clipfrac_right, pg_clipfrac_left_mean, pg_clipfrac_right_mean, avg_max_prob_left_clipped, avg_max_prob_right_clipped
+
 def compute_policy_loss(
     old_log_prob,
     log_prob,
@@ -669,7 +821,6 @@ def compute_policy_loss(
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
-
 
 @register_policy_loss("clip_cov")
 def compute_policy_loss_clip_cov(
