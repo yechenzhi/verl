@@ -650,7 +650,7 @@ def compute_policy_loss(
     # START OF MODIFICATION: Adaptive Clipping Logic
     # =================================================================================
     if use_adaptive_clipping:
-        print("Using Adaptive Clipping.")
+        # print("Using Adaptive Clipping.")
         assert vocab_size is not None and vocab_size > 0, \
             "vocab_size must be provided when use_adaptive_clipping is True."
         
@@ -665,7 +665,7 @@ def compute_policy_loss(
         current_clip_low = cliprange_low
         current_clip_high = cliprange_high
     else:
-        print("Using Fixed Clipping.")
+        # print("Using Fixed Clipping.")
         # 恢复原始逻辑：使用固定的 clip 值
         current_clip_low = cliprange_low if cliprange_low is not None else cliprange
         current_clip_high = cliprange_high if cliprange_high is not None else cliprange
