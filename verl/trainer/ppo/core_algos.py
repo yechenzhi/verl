@@ -245,6 +245,7 @@ def compute_gae_advantage_return(
 @register_adv_est(AdvantageEstimator.GRPO)  # or simply: @register_adv_est("grpo")
 def compute_grpo_outcome_advantage(
     token_level_rewards: torch.Tensor,
+    entropys: torch.Tensor,
     response_mask: torch.Tensor,
     index: np.ndarray,
     epsilon: float = 1e-6,
@@ -304,7 +305,11 @@ def compute_grpo_outcome_advantage(
             else:
                 scores[i] = scores[i] - id2mean[index[i]]
         scores = scores.unsqueeze(-1) * response_mask
-
+        # mask = scores < 0 
+        # scores[mask] += 0.05 * entropys[mask]
+        # import pdb; pdb.set_trace()
+        mask = (scores < 0) & (entropys > 1.0)
+        scores[mask] += 0.1 * entropys[mask]
     return scores, scores
 
 

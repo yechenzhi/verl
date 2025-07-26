@@ -416,6 +416,7 @@ class DataParallelPPOActor(BasePPOActor):
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
 
+
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
 
                     if self.config.policy_loss.loss_mode == "vanilla":

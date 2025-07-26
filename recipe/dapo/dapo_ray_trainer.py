@@ -350,11 +350,22 @@ class RayDAPOTrainer(RayPPOTrainer):
                         prompt_uid2metric_std = {}
                         for prompt_uid, metric_vals in prompt_uid2metric_vals.items():
                             prompt_uid2metric_std[prompt_uid] = np.std(metric_vals)
+                        
+                        prompt_uid2metric_mean = {}
+                        for prompt_uid, metric_vals in prompt_uid2metric_vals.items():
+                            prompt_uid2metric_mean[prompt_uid] = np.mean(metric_vals)
 
-                        kept_prompt_uids = [
+                        kept_prompt_uids_1 = [
                             uid
                             for uid, std in prompt_uid2metric_std.items()
                             if std > 0 or len(prompt_uid2metric_vals[uid]) == 1
+                        ]
+
+                        acc_thresh = self.config.algorithm.filter_groups.acc_thresh
+                        kept_prompt_uids = [
+                            uid
+                            for uid, mean in prompt_uid2metric_mean.items()
+                            if mean < acc_thresh and uid in kept_prompt_uids_1
                         ]
                         num_prompt_in_batch += len(kept_prompt_uids)
 
@@ -365,10 +376,11 @@ class RayDAPOTrainer(RayPPOTrainer):
 
                         new_batch = new_batch[kept_traj_idxs]
                         batch = new_batch if batch is None else DataProto.concat([batch, new_batch])
+                        traj_bsz = self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n
 
-                        prompt_bsz = self.config.data.train_batch_size
-                        if num_prompt_in_batch < prompt_bsz:
-                            print(f"{num_prompt_in_batch=} < {prompt_bsz=}")
+                        # prompt_bsz = self.config.data.train_batch_size
+                        if len(batch) < traj_bsz:
+                            print(f"{len(batch)=} < {traj_bsz=}")
                             max_num_gen_batches = self.config.algorithm.filter_groups.max_num_gen_batches
                             if max_num_gen_batches <= 0 or num_gen_batches < max_num_gen_batches:
                                 print(f"{num_gen_batches=}. Keep generating...")
@@ -384,6 +396,9 @@ class RayDAPOTrainer(RayPPOTrainer):
                             # Align the batch
                             traj_bsz = self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n
                             batch = batch[:traj_bsz]
+
+                            all_valid_uids = sorted(list(set(batch.non_tensor_batch["uid"])))
+                            print(f"最终批次构建完成。包含 {len(all_valid_uids)} 个 prompts 和 {len(batch)} 个 trajectories。")
 
                     # === Updating ===
 
@@ -459,6 +474,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                         norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
                         batch = compute_advantage(
                             batch,
+                            entropys,
                             adv_estimator=self.config.algorithm.adv_estimator,
                             gamma=self.config.algorithm.gamma,
                             lam=self.config.algorithm.lam,

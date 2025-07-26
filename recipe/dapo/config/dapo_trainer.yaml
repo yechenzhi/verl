@@ -24,7 +24,7 @@ algorithm:
     metric: null # acc / score / seq_reward / seq_final_reward / ...
     max_num_gen_batches: 0 # Non-positive values mean no upper limit
     filter_long_rollouts: False # filter rollouts which are clipped
-    balance_negative_ratios: False
+    acc_thresh: 1.0
 
 trainer:
   project_name: verl-dapo
