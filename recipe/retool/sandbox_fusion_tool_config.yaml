@@ -1,7 +1,7 @@
 tools:
   - class_name: "recipe.retool.retool.CustomSandboxFusionTool"
     config:
-      sandbox_fusion_url: "https://***.apigateway-cn-beijing.volceapi.com/run_code"
+      sandbox_fusion_url: "https://sd23eslufnav2uhs5dol0.apigateway-cn-beijing.volceapi.com/?token=7a5a322b-be7f-4b0e-b87c-e1ad890317b3"
       num_workers: 128
       enable_global_rate_limit: true
       rate_limit: 128

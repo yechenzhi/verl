@@ -41,13 +41,13 @@ max_token=30720
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
 WORKING_DIR=${WORKING_DIR:-"${PWD}"}
 RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
-NNODES=${NNODES:-4}
+NNODES=${NNODES:-1}
 # Paths
-RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
-MODEL_PATH=${MODEL_PATH:-"/YOUR_MODELPATH"}
-CKPTS_DIR=${CKPTS_DIR:-"/YOUR_CKPTS_PATH"}
-TRAIN_FILE=${TRAIN_FILE:-"/YOUR_TRAIN_FILE_PATH"}
-TEST_FILE=${TEST_FILE:-["/YOUR_TRAIN_FILE_PATH"]}
+RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/highspeedstorage/h800"}
+MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen2.5-7B"}
+CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
+TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
+TEST_FILE=${TEST_FILE:-"[${RAY_DATA_HOME}/data/aime-2024-deduplicated.parquet,${RAY_DATA_HOME}/data/aime-2025.parquet]"}
 
 # Algorithm
 temperature=1.0
